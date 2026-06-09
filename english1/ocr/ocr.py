@@ -9,10 +9,6 @@
   python3 ocr.py /path/to/2019年考研英语二真题.pdf 2019 /path/to/english2/ocr/
 
 输出文件: <输出目录>/<两位年份>.md，例如 19.md
-
-注意: 脚本无法自动识别斜体和下划线，生成后需手动补:
-  - 书名/期刊名: *Title*
-  - 词义题目标词: <u>word</u>（passage 和 question 里都要加）
 """
 
 import subprocess
@@ -77,6 +73,133 @@ def clean_stem(stem):
     # Remove trailing 5+ spaces (with optional trailing .  or ,) — fill-in-blank artifacts
     stem = re.sub(r'\s{5,}[.,]?\s*$', '', stem)
     return stem.rstrip()
+
+
+# Matches vocabulary-type question stems: The word/phrase "X" (Line N, Para. M)...
+# Use \u escapes in double-quoted strings so the file stays ASCII-clean.
+_OPENQ  = "[\u201c\u2018\"']"
+_CLOSEQ = "[\u201d\u2019\"']"
+_INNERQ = "[^\u201c\u201d\u2018\u2019\"']+"
+_VOCAB_RE = re.compile(
+    r'[Tt]he (?:word|phrase|expression)s?\s+' + _OPENQ + r'(' + _INNERQ + r')' + _CLOSEQ
+    + r'\s*\(.*?Para\.?\s*(\d+)',
+    re.IGNORECASE,
+)
+_VOCAB_RE2 = re.compile(
+    r'[Tt]he (?:word|phrase|expression)s?\s+' + _OPENQ + r'(' + _INNERQ + r')' + _CLOSEQ,
+    re.IGNORECASE,
+)
+
+
+def _is_clean_italic(t):
+    """Return True if t looks like a real italic word/phrase (not garbled OCR)."""
+    if len(t) < 3:
+        return False
+    if any(ord(c) < 32 for c in t):   # control characters
+        return False
+    if not all(c.isascii() for c in t):   # non-ASCII (Cyrillic, CJK, etc.)
+        return False
+    if not (t[0].isalpha() or t[0] in '"\'('):
+        return False
+    alpha = sum(1 for c in t if c.isalpha())
+    return alpha >= len(t) * 0.4
+
+
+def get_italic_spans(pdf_path):
+    """Return deduplicated list of clean italic phrases from PDF, longest first."""
+    try:
+        import fitz
+    except ImportError:
+        return []
+
+    doc = fitz.open(pdf_path)
+    seen = set()
+    spans = []
+
+    for page in doc:
+        for b in page.get_text("dict")["blocks"]:
+            if b["type"] != 0:
+                continue
+            for line in b["lines"]:
+                parts = []
+                for span in line["spans"]:
+                    if span["flags"] & 2:   # italic flag
+                        t = span["text"].strip()
+                        if t:
+                            parts.append(t)
+                    else:
+                        if parts:
+                            merged = re.sub(r'\s+', ' ', ' '.join(parts)).strip()
+                            merged = merged.rstrip('.,;:"\'')
+                            if _is_clean_italic(merged) and merged not in seen:
+                                seen.add(merged)
+                                spans.append(merged)
+                            parts = []
+                if parts:
+                    merged = re.sub(r'\s+', ' ', ' '.join(parts)).strip()
+                    merged = merged.rstrip('.,;:"\'')
+                    if _is_clean_italic(merged) and merged not in seen:
+                        seen.add(merged)
+                        spans.append(merged)
+
+    # Sort longest first; drop spans that are pure substrings of a longer span
+    spans.sort(key=len, reverse=True)
+    final = []
+    for s in spans:
+        if not any(s in longer for longer in final):
+            final.append(s)
+    return final
+
+
+def apply_formatting(texts, pdf_path):
+    """Apply *italic* markup and <u>vocab</u> underlines to passage paragraphs."""
+    italic_spans = get_italic_spans(pdf_path)
+
+    for text in texts:
+        passage = text['passage']
+
+        # ── 1. Italic markup ────────────────────────────────────────────────
+        for span in italic_spans:
+            escaped = re.escape(span)
+            # Use word boundaries for single-word spans to avoid partial matches
+            # (e.g. span "purpose" should not match inside "purposes")
+            if ' ' not in span and not re.search(r'[^\w]', span):
+                pattern = r'\b' + escaped + r'\b'
+            else:
+                pattern = escaped
+            for i, para in enumerate(passage):
+                passage[i] = re.sub(pattern, f'*{span}*', passage[i])
+
+        # ── 2. Vocabulary underlines ─────────────────────────────────────────
+        for q in text['questions']:
+            stem = q['stem']
+            m = _VOCAB_RE.search(stem)
+            if m:
+                word, para_num = m.group(1), int(m.group(2))
+                idx = para_num - 1   # 1-indexed → 0-indexed
+            else:
+                m2 = _VOCAB_RE2.search(stem)
+                if not m2:
+                    continue
+                word, idx = m2.group(1), None
+
+            pattern = re.compile(re.escape(word), re.IGNORECASE)
+            repl = lambda mo: f'<u>{mo.group(0)}</u>'
+
+            if idx is not None and 0 <= idx < len(passage):
+                # Try the specified paragraph first
+                new_para = pattern.sub(repl, passage[idx], count=1)
+                if new_para != passage[idx]:
+                    passage[idx] = new_para
+                    continue
+            # Fallback: first occurrence in any paragraph
+            for i, para in enumerate(passage):
+                new_para = pattern.sub(repl, para, count=1)
+                if new_para != para:
+                    passage[i] = new_para
+                    break
+
+    return texts
 
 
 def parse_text_header(stripped):
@@ -309,6 +432,8 @@ def main():
     if not texts:
         sys.exit("No texts parsed — check PDF structure or adjust patterns")
 
+    apply_formatting(texts, pdf_path)
+
     print(f"Parsed {len(texts)} texts:")
     for t in texts:
         nq = len(t['questions'])
@@ -330,9 +455,6 @@ def main():
         f.write(md)
 
     print(f"\nWritten: {out_path}")
-    print("\n[手动补充]")
-    print("  书名/期刊名:  *Title*")
-    print("  词义题下划线: <u>word</u>（passage 和 question 里都要加）")
 
 
 if __name__ == '__main__':
