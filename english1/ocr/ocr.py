@@ -77,6 +77,10 @@ def clean_stem(stem):
 
 # Matches vocabulary-type question stems: The word/phrase "X" (Line N, Para. M)...
 # Use \u escapes in double-quoted strings so the file stays ASCII-clean.
+_c201c = chr(0x201C)
+_c201d = chr(0x201D)
+_c2018 = chr(0x2018)
+_c2019 = chr(0x2019)
 _OPENQ  = "[\u201c\u2018\"']"
 _CLOSEQ = "[\u201d\u2019\"']"
 _INNERQ = "[^\u201c\u201d\u2018\u2019\"']+"
@@ -170,10 +174,26 @@ def apply_formatting(texts, pdf_path):
             for i, para in enumerate(passage):
                 passage[i] = re.sub(pattern, f'*{span}*', passage[i])
 
-        # ── 2. Vocabulary underlines ─────────────────────────────────────────
+        # ── 2. Vocabulary / quoted-phrase underlines ────────────────────────
+        # _VOCAB_RE  : "The word/phrase X" with Para reference (vocab questions)
+        # _QUOTE_RE  : any quoted text + (Para N) reference (covers "By saying X" etc.)
+        # _VOCAB_RE2 : "The word/phrase X" without Para reference (fallback)
+        _QUOTE_RE = re.compile(
+            _OPENQ + r'([^'
+            + _c201c + _c201d + _c2018 + _c2019
+            + r'"\']{3,90})' + _CLOSEQ
+            + r'\s*[^(]{0,20}\(.*?Para\.?\s*(\d+)',
+            re.IGNORECASE,
+        )
         for q in text['questions']:
             stem = q['stem']
-            m = _VOCAB_RE.search(stem)
+            # Skip if ellipsis — truncated phrase can't match passage text
+            if '...' in stem or '\u2026' in stem:
+                m_skip = _VOCAB_RE.search(stem)
+                if not m_skip:
+                    continue
+
+            m = _VOCAB_RE.search(stem) or _QUOTE_RE.search(stem)
             if m:
                 word, para_num = m.group(1), int(m.group(2))
                 idx = para_num - 1   # 1-indexed → 0-indexed
@@ -183,11 +203,14 @@ def apply_formatting(texts, pdf_path):
                     continue
                 word, idx = m2.group(1), None
 
-            pattern = re.compile(re.escape(word), re.IGNORECASE)
+            word = word.strip()
+            if len(word) < 2 or '...' in word or '\u2026' in word:
+                continue
+
             repl = lambda mo: f'<u>{mo.group(0)}</u>'
+            pattern = re.compile(re.escape(word), re.IGNORECASE)
 
             if idx is not None and 0 <= idx < len(passage):
-                # Try the specified paragraph first
                 new_para = pattern.sub(repl, passage[idx], count=1)
                 if new_para != passage[idx]:
                     passage[idx] = new_para
